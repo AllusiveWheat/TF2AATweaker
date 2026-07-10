@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <intrin.h>
 
 AUTOHOOK_INIT();
 
@@ -34,6 +35,16 @@ constexpr float kSnapshotPrefireWindowSeconds = 0.20f;
 constexpr float kSnapshotBlockSeconds = 0.20f;
 constexpr float kMinCmdFrameSeconds = 1.0f / 200.0f; // 200 FPS cap
 constexpr float kMaxValidFrameSeconds = 1.0f / 20.0f; // ignore large hitch samples
+
+// client.dll+0x99410 uses these values to turn the target-direction response
+// into the multiplier applied to raw stick input.
+constexpr float kFrictionFloor = 0.65f;
+constexpr float kFrictionRampStart = 0.10f;
+constexpr float kFrictionRampEnd = 0.20f;
+constexpr float kFrictionRampRange = kFrictionRampEnd - kFrictionRampStart;
+constexpr float kFrictionRampAmount = 1.0f - kFrictionFloor;
+constexpr float kTimeRampFrictionAmount = 0.95f;
+constexpr uintptr_t kAimAssistApplyFrictionReturnRva = 0x999A1;
 
 static float GetFrameSeconds(float frameSecondsHint)
 {
@@ -80,6 +91,63 @@ static float GetAimAssistScale(float frameSecondsHint, bool applyFpsNormalisatio
 static float GetGlobalAimAssistMultiplier()
 {
 	return std::max(0.0f, GetAimAssistMultiplier());
+}
+
+static float GetStickinessMultiplier()
+{
+	// Strength values above 1 are valid for pull amplification, but a friction
+	// multiplier above the native value would invert or over-amplify sensitivity.
+	return std::clamp(GetGlobalAimAssistMultiplier(), 0.0f, 1.0f);
+}
+
+static float GetNativeFrictionFloor(__int64 aimAssistContext, bool hasActiveFriction)
+{
+	if (hasActiveFriction)
+		return kFrictionFloor;
+
+	if (!aimAssistContext)
+		return 1.0f;
+
+	const float timeSinceFriction = *reinterpret_cast<float*>(aimAssistContext + 0x130);
+	if (timeSinceFriction <= kFrictionRampStart)
+		return kFrictionFloor;
+	if (timeSinceFriction >= kFrictionRampEnd)
+		return 1.0f;
+
+	return kFrictionFloor +
+		((timeSinceFriction - kFrictionRampStart) / kFrictionRampRange) * kFrictionRampAmount;
+}
+
+static float ScaleFrictionResponse(float nativeResponse, float nativeTimeRamp, float nativeFloor, float strength)
+{
+	const float response = std::clamp(nativeResponse, 0.0f, 1.0f);
+	const float timeRamp = std::clamp(nativeTimeRamp, 0.0f, 1.0f);
+	const float floor = std::clamp(nativeFloor, 0.0f, 1.0f);
+
+	// Native scalar in client.dll+0x99410:
+	//   (1 - 0.95 * timeRamp) * (floor + response * (1 - floor))
+	const float nativeTimeScalar = 1.0f - kTimeRampFrictionAmount * timeRamp;
+	const float nativeResponseScalar = floor + response * (1.0f - floor);
+	const float nativeStickinessScalar = nativeTimeScalar * nativeResponseScalar;
+
+	// Blend the complete native sensitivity scalar toward identity.  This is the
+	// important part: multiplying raw input or one intermediate factor directly
+	// changes the player's sensitivity and does not produce a linear reduction.
+	const float targetScalar = 1.0f - (1.0f - nativeStickinessScalar) * strength;
+	const float scaledTimeScalar = 1.0f - kTimeRampFrictionAmount * timeRamp * strength;
+
+	if (floor >= 1.0f || scaledTimeScalar <= 0.0f)
+		return response;
+
+	const float scaledResponse = (targetScalar / scaledTimeScalar - floor) / (1.0f - floor);
+	return std::clamp(scaledResponse, 0.0f, 1.0f);
+}
+
+static bool IsAimAssistApplyFrictionCall()
+{
+	const HMODULE clientModule = GetModuleHandleA("client.dll");
+	const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
+	return clientModule && returnAddress == reinterpret_cast<uintptr_t>(clientModule) + kAimAssistApplyFrictionReturnRva;
 }
 
 static void ApplyVec2Scale(float* vec, float scale)
@@ -146,12 +214,70 @@ AUTOHOOK(AimAssistApplyContext, client.dll + 0x99410, void, (__int64 a1, char a2
 	AimAssistApplyContext(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
 }
 
-typedef double (*AimAssistTimeRampType)(__int64 a1, __int64 a2, int a3);
-AUTOHOOK(AimAssistTimeRamp, client.dll + 0x9A120, double, (__int64 a1, __int64 a2, int a3))
+typedef double (*AimAssistTimeRampType)(__int64 player, __int64 aimAssistContext, int mode);
+AUTOHOOK(AimAssistTimeRamp, client.dll + 0x9A120, double, (__int64 player, __int64 aimAssistContext, int mode))
 {
-	const double base = AimAssistTimeRamp(a1, a2, a3);
-	const float scaled = std::clamp(static_cast<float>(base) * GetGlobalAimAssistMultiplier(), 0.0f, 1.0f);
-	return static_cast<double>(scaled);
+	const double nativeTimeRamp = AimAssistTimeRamp(player, aimAssistContext, mode);
+
+	// mode 0 drives the friction scalar in AimAssistApplyContext.  Mode 1 is
+	// passed to the ADS-pull-delta path and must retain the game's timing.
+	if (mode != 0)
+		return nativeTimeRamp;
+
+	return nativeTimeRamp * GetStickinessMultiplier();
+}
+
+typedef float (*AimAssistFrictionScaleType)(
+	__int64 player,
+	__int64 aimAssistContext,
+	__int64 lookSenseInfo,
+	char hasActiveFriction,
+	char hasTarget,
+	float* playerOrigin,
+	float* targetPoint,
+	float* viewOrigin,
+	float targetDistance,
+	float lookX,
+	float lookY);
+AUTOHOOK(AimAssistFrictionScale,
+	client.dll + 0x9A7B0,
+	float,
+	(__int64 player,
+		__int64 aimAssistContext,
+		__int64 lookSenseInfo,
+		char hasActiveFriction,
+		char hasTarget,
+		float* playerOrigin,
+		float* targetPoint,
+		float* viewOrigin,
+		float targetDistance,
+		float lookX,
+		float lookY))
+{
+	const float nativeResponse = AimAssistFrictionScale(
+		player,
+		aimAssistContext,
+		lookSenseInfo,
+		hasActiveFriction,
+		hasTarget,
+		playerOrigin,
+		targetPoint,
+		viewOrigin,
+		targetDistance,
+		lookX,
+		lookY);
+
+	// The same helper also has an auxiliary caller at client.dll+0x9D23D.
+	// Only 0x99410 builds the raw-stick sensitivity scalar described above.
+	if (!IsAimAssistApplyFrictionCall())
+		return nativeResponse;
+
+	// Call the original trampoline to recover the unscaled mode-0 ramp.  The
+	// caller receives the scaled ramp from our hook, so this lets us remap the
+	// complete sensitivity scalar exactly rather than approximating it.
+	const float nativeTimeRamp = static_cast<float>(AimAssistTimeRamp(player, aimAssistContext, 0));
+	const float nativeFloor = GetNativeFrictionFloor(aimAssistContext, hasActiveFriction != 0);
+	return ScaleFrictionResponse(nativeResponse, nativeTimeRamp, nativeFloor, GetStickinessMultiplier());
 }
 
 AUTOHOOK(AimAssistDo, client.dll + 0x9FCE0, bool, (__int64 player, char a2, char* a3, float a4))
@@ -167,6 +293,10 @@ typedef void (*AimAssistStickPullType)(
 AUTOHOOK(AimAssistStickPull, client.dll + 0xA0B80, void, (__int64 a1, __int64 a2, float* a3, char a4, float a5, float a6, float a7, float a8, float* a9, float* a10, float* a11))
 {
 	AimAssistStickPull(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+
+	// client.dll+0xA0B80 clears a10/a11 before writing the generated pull.
+	// client.dll+0x99410 adds those values to the player's raw look input later,
+	// so scaling these outputs attenuates only ADS pull, never sensitivity.
 	const float multiplier = GetGlobalAimAssistMultiplier();
 	if (a10)
 		*a10 *= multiplier;
